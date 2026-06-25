@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Bezier Connection Handles",
     "author": "Alessio Fumagalli",
-    "version": (1, 5, 0),
+    "version": (1, 5, 2),
     "blender": (5, 0, 0),
     "location": "Geometry Nodes > Add",
-    "description": "Compute B Second as a point geometry from A End/A Prev for G1 continuation with degree toggles",
+    "description": "Compute B Second/Q1 as real Points geometry from A End/A Prev for G1 continuation with degree toggles",
     "category": "Node",
 }
 
@@ -202,28 +202,13 @@ def build_group():
 
     # G1 gives Q1 = A_end + k * (n_in / n_out) * (A_end - A_prev)
     # where k is the proportionality coefficient.
-    # We output B Second:
-    # - deg2 output: B Second = Q1
-    # - deg3 output: B Second = Q2 = A_end + 2*(Q1 - A_end)
-    out_mul = switch_float((300, 80))
-    _link(
-        links,
-        n_in.outputs["Output Is Cubic (Deg3)"],
-        _find_socket(out_mul.inputs, ["Switch"]),
-    )
-    _link(links, make_value(1.0, (120, 40)), _find_socket(out_mul.inputs, ["False"]))
-    _link(links, c2, _find_socket(out_mul.inputs, ["True"]))
-
-    scale_base = nodes.new("ShaderNodeMath")
-    scale_base.location = (480, 150)
-    scale_base.operation = "MULTIPLY"
-    _link(links, ratio.outputs[0], scale_base.inputs[0])
-    _link(links, _find_socket(out_mul.outputs, ["Output"]), scale_base.inputs[1])
-
+    # We always output B Second = Q1.
+    # This is true also when the output curve is cubic: in that case Q1 is the
+    # second control point of the cubic curve, immediately after Q0/A_end.
     scale = nodes.new("ShaderNodeMath")
-    scale.location = (640, 150)
+    scale.location = (480, 150)
     scale.operation = "MULTIPLY"
-    _link(links, scale_base.outputs[0], scale.inputs[0])
+    _link(links, ratio.outputs[0], scale.inputs[0])
     _link(links, n_in.outputs["G1"], scale.inputs[1])
 
     v_scaled = vec_math("SCALE", (820, 40))
@@ -242,25 +227,62 @@ def build_group():
         _find_socket(b_second.inputs, ["Vector_001"]),
     )
 
-    p = nodes.new("GeometryNodeMeshLine")
-    p.location = (1190, 90)
-    p.inputs["Count"].default_value = 1
-    p.inputs["Offset"].default_value = (0.0, 0.0, 0.0)
+    # Output B Second as a real Points component, not as a single mesh vertex.
+    # This keeps it compatible with the Bezier Curve node, which samples the
+    # first point on the POINT domain, and also makes the output behave as a
+    # proper point geometry when passed through Join Geometry.
+    try:
+        # Blender Geometry Nodes: Points primitive.
+        p = nodes.new("GeometryNodePoints")
+        p.location = (1190, 40)
 
-    set_p = nodes.new("GeometryNodeSetPosition")
-    set_p.location = (1380, 40)
-    _link(
-        links,
-        _find_socket(p.outputs, ["Mesh"]),
-        _find_socket(set_p.inputs, ["Geometry"]),
-    )
-    _link(
-        links,
-        _find_socket(b_second.outputs, ["Vector"]),
-        _find_socket(set_p.inputs, ["Position"]),
-    )
+        if _find_socket(p.inputs, ["Count"]):
+            p.inputs["Count"].default_value = 1
+        if _find_socket(p.inputs, ["Radius"]):
+            p.inputs["Radius"].default_value = 0.05
 
-    _link(links, _find_socket(set_p.outputs, ["Geometry"]), n_out.inputs["B Second"])
+        _link(
+            links,
+            _find_socket(b_second.outputs, ["Vector"]),
+            _find_socket(p.inputs, ["Position"]),
+        )
+        _link(links, _find_socket(p.outputs, ["Points", "Geometry"]), n_out.inputs["B Second"])
+
+    except Exception:
+        # Fallback for Blender builds where GeometryNodePoints is unavailable:
+        # create one mesh vertex, move it to Q1, then convert that vertex to Points.
+        p = nodes.new("GeometryNodeMeshLine")
+        p.location = (1190, 90)
+        p.inputs["Count"].default_value = 1
+        p.inputs["Offset"].default_value = (0.0, 0.0, 0.0)
+
+        set_p = nodes.new("GeometryNodeSetPosition")
+        set_p.location = (1380, 40)
+        _link(
+            links,
+            _find_socket(p.outputs, ["Mesh", "Geometry"]),
+            _find_socket(set_p.inputs, ["Geometry"]),
+        )
+        _link(
+            links,
+            _find_socket(b_second.outputs, ["Vector"]),
+            _find_socket(set_p.inputs, ["Position"]),
+        )
+
+        mesh_to_points = nodes.new("GeometryNodeMeshToPoints")
+        mesh_to_points.location = (1570, 40)
+        if _find_socket(mesh_to_points.inputs, ["Radius"]):
+            mesh_to_points.inputs["Radius"].default_value = 0.05
+        _link(
+            links,
+            _find_socket(set_p.outputs, ["Geometry"]),
+            _find_socket(mesh_to_points.inputs, ["Mesh", "Geometry"]),
+        )
+        _link(
+            links,
+            _find_socket(mesh_to_points.outputs, ["Points", "Geometry"]),
+            n_out.inputs["B Second"],
+        )
 
     return ng
 
