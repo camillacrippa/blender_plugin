@@ -1,14 +1,15 @@
 bl_info = {
     "name": "Parametric Surface",
     "author": "Alessio Fumagalli",
-    "version": (1, 0, 1),
-    "blender": (5, 0, 0),
+    "version": (1, 1, 0),
+    "blender": (4, 5, 0),
     "location": "Geometry Nodes > Add",
     "description": "Parametric surface primitive (x(u,v), y(u,v), z(u,v)) built from native Geometry Nodes",
     "category": "Node",
 }
 
 import bpy
+from bpy.props import StringProperty, CollectionProperty
 from math import pi, e, tau
 import re
 import random  # <<< ADDED (only for hidden random)
@@ -21,6 +22,12 @@ HIDDEN_PROP = "hidden_random"
 DIGITS_PROP = "hidden_random_digits"
 MIN_PROP = "hidden_random_min"
 MAX_PROP = "hidden_random_max"
+GROUP_MARKER = "_parametric_surface_group"
+SETTINGS_COLLECTION = "parametric_surface_node_settings"
+
+DEFAULT_X_EXPR = "sin(v)*cos(u)"
+DEFAULT_Y_EXPR = "sin(v)*sin(u)"
+DEFAULT_Z_EXPR = "cos(v)"
 
 
 def rand_with_digits(digits: int) -> int:
@@ -29,6 +36,110 @@ def rand_with_digits(digits: int) -> int:
     lo = 10 ** (digits - 1)
     hi = 10 ** digits - 1
     return random.randint(lo, hi)
+
+
+
+# -------------------------------------------------------------------
+# Compatibility helpers for Blender 4.5 LTS -> Blender 5.x
+# -------------------------------------------------------------------
+def get_editor_tree(context):
+    """Return the node tree currently edited in the Node Editor."""
+    space = getattr(context, "space_data", None)
+    if not space:
+        return None
+    return getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+
+
+def is_parametric_surface_node(node):
+    """Recognize new nodes and nodes created by the old v1.0.x add-on."""
+    if not node or node.bl_idname != "GeometryNodeGroup" or not node.node_tree:
+        return False
+
+    ng = node.node_tree
+    try:
+        if bool(ng.get(GROUP_MARKER, False)):
+            return True
+    except Exception:
+        pass
+
+    # Backward compatibility for old files, where no explicit marker existed.
+    return ng.name.startswith(GROUP_NAME)
+
+
+def get_active_parametric_node(context):
+    """Resolve the active node consistently across Blender 4.5 and 5.x."""
+    tree = get_editor_tree(context)
+    if tree is None:
+        return None
+
+    node = getattr(context, "active_node", None)
+    if node is None or getattr(node, "id_data", None) != tree:
+        node = getattr(tree.nodes, "active", None)
+
+    return node if is_parametric_surface_node(node) else None
+
+
+class ParametricSurfaceNodeSettings(bpy.types.PropertyGroup):
+    """Per Parametric Surface node expressions, stored on the parent NodeTree.
+
+    NodeTree is an ID data-block, so this avoids the pre-5.0 ambiguity of using
+    raw custom properties directly on GeometryNodeGroup node instances.
+    """
+
+    node_name: StringProperty(name="Node", default="")
+    x_expr: StringProperty(name="x(u,v)", default=DEFAULT_X_EXPR)
+    y_expr: StringProperty(name="y(u,v)", default=DEFAULT_Y_EXPR)
+    z_expr: StringProperty(name="z(u,v)", default=DEFAULT_Z_EXPR)
+
+
+def get_surface_settings(parent_tree, node, create=True):
+    """Get/create the expression record belonging to one node instance."""
+    if parent_tree is None or node is None:
+        return None
+
+    settings_collection = getattr(parent_tree, SETTINGS_COLLECTION, None)
+    if settings_collection is None:
+        return None
+
+    # Node names are unique inside one NodeTree, so this is per-instance.
+    for item in settings_collection:
+        if item.node_name == node.name:
+            return item
+
+    if not create:
+        return None
+
+    item = settings_collection.add()
+    item.node_name = node.name
+
+    # One-time migration from v1.0.x raw node custom properties.
+    try:
+        item.x_expr = str(node.get("x_expr", DEFAULT_X_EXPR))
+        item.y_expr = str(node.get("y_expr", DEFAULT_Y_EXPR))
+        item.z_expr = str(node.get("z_expr", DEFAULT_Z_EXPR))
+    except Exception:
+        item.x_expr = DEFAULT_X_EXPR
+        item.y_expr = DEFAULT_Y_EXPR
+        item.z_expr = DEFAULT_Z_EXPR
+
+    return item
+
+
+def ensure_node_is_active(tree, node):
+    """Make active-node state explicit; Blender 4.5 can otherwise lag here."""
+    if tree is None or node is None:
+        return
+    for other in tree.nodes:
+        other.select = False
+    node.select = True
+    tree.nodes.active = node
+
+
+def make_node_tree_single_user(node):
+    """Fork a shared group before rebuilding, so duplicated nodes stay independent."""
+    if node and node.node_tree and node.node_tree.users > 1:
+        node.node_tree = node.node_tree.copy()
+        node.node_tree[GROUP_MARKER] = True
 
 
 # -----------------------------
@@ -331,6 +442,7 @@ def build_group_from_expressions(x_expr, y_expr, z_expr, ng=None):
     ng[DIGITS_PROP] = int(digits)
     ng[MIN_PROP] = str(10 ** (digits - 1))
     ng[MAX_PROP] = str(10 ** digits - 1)
+    ng[GROUP_MARKER] = True
 
     iface = ng.interface
     ensure_socket(iface, "Geometry", "OUTPUT", "NodeSocketGeometry")
@@ -431,19 +543,31 @@ class NODE_OT_add_parametric_surface_gn(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        ng = build_group_from_expressions("sin(v)*cos(u)", "sin(v)*sin(u)", "cos(v)")
-        tree = context.space_data.edit_tree
+        tree = get_editor_tree(context)
+        if tree is None:
+            self.report({"ERROR"}, "No editable Geometry Nodes tree found")
+            return {"CANCELLED"}
+
+        ng = build_group_from_expressions(DEFAULT_X_EXPR, DEFAULT_Y_EXPR, DEFAULT_Z_EXPR)
         node = tree.nodes.new("GeometryNodeGroup")
         node.node_tree = ng
         node.label = GROUP_NAME
         node.location = getattr(context.space_data, "cursor_location", (0, 0))
-        node["x_expr"] = "sin(v)*cos(u)"
-        node["y_expr"] = "sin(v)*sin(u)"
-        node["z_expr"] = "cos(v)"
+
+        # Create a dedicated formula record for this exact node instance.
+        settings = get_surface_settings(tree, node, create=True)
+        if settings is not None:
+            settings.x_expr = DEFAULT_X_EXPR
+            settings.y_expr = DEFAULT_Y_EXPR
+            settings.z_expr = DEFAULT_Z_EXPR
+
+        # Important on Blender 4.5: nodes.new() does not always leave the new
+        # scripted node as the active node seen by a custom sidebar panel.
+        ensure_node_is_active(tree, node)
 
         out = next((n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"), None)
         if out and "Geometry" in out.inputs and "Geometry" in node.outputs:
-            context.space_data.edit_tree.links.new(node.outputs["Geometry"], out.inputs["Geometry"])
+            tree.links.new(node.outputs["Geometry"], out.inputs["Geometry"])
         return {"FINISHED"}
 
 
@@ -455,33 +579,54 @@ class NODE_OT_build_parametric_surface(bpy.types.Operator):
     bl_label = "Build Surface"
     bl_options = {"REGISTER", "UNDO"}
 
+    # Passed by the panel so Blender 4.5 cannot accidentally rebuild a stale
+    # active node when more than one Parametric Surface exists.
+    parent_tree_name: StringProperty(options={"HIDDEN"})
+    node_name: StringProperty(options={"HIDDEN"})
+
+    def _resolve_tree_and_node(self, context):
+        tree = get_editor_tree(context)
+
+        if self.parent_tree_name:
+            candidate = bpy.data.node_groups.get(self.parent_tree_name)
+            if candidate is not None:
+                tree = candidate
+
+        if tree is not None and self.node_name:
+            node = tree.nodes.get(self.node_name)
+            if is_parametric_surface_node(node):
+                return tree, node
+
+        node = get_active_parametric_node(context)
+        return tree, node
+
     def execute(self, context):
-        tree = context.space_data.edit_tree
-        node = tree.nodes.active
-        if (
-            not node
-            or node.bl_idname != "GeometryNodeGroup"
-            or not node.node_tree
-            or not node.node_tree.name.startswith(GROUP_NAME)
-        ):
+        tree, node = self._resolve_tree_and_node(context)
+        if tree is None or not is_parametric_surface_node(node):
             self.report({"ERROR"}, "Select the 'Parametric Surface' node to build")
             return {"CANCELLED"}
 
-        x_expr = node.get("x_expr", "sin(v)*cos(u)")
-        y_expr = node.get("y_expr", "sin(v)*sin(u)")
-        z_expr = node.get("z_expr", "cos(v)")
+        settings = get_surface_settings(tree, node, create=True)
+        if settings is None:
+            self.report({"ERROR"}, "Could not access Parametric Surface settings")
+            return {"CANCELLED"}
+
+        x_expr = settings.x_expr
+        y_expr = settings.y_expr
+        z_expr = settings.z_expr
 
         try:
-            # FIX: If the node tree is shared (e.g., duplicated), fork it to make a unique copy
-            if node.node_tree.users > 1:
-                node.node_tree = node.node_tree.copy()
-
+            # If the GeometryNodeGroup was duplicated, make its internal group
+            # single-user before rebuilding. Formulas themselves are already
+            # per-node because they live on the parent NodeTree record above.
+            make_node_tree_single_user(node)
             ng = build_group_from_expressions(x_expr, y_expr, z_expr, ng=node.node_tree)
         except Exception as ex:
             self.report({"ERROR"}, f"Parse/build error: {ex}")
             return {"CANCELLED"}
 
         node.node_tree = ng
+        ensure_node_is_active(tree, node)
         self.report({"INFO"}, "Parametric surface rebuilt")
         return {"FINISHED"}
 
@@ -497,24 +642,29 @@ class NODE_PT_parametric_surface(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        tree = getattr(context.space_data, "edit_tree", None)
-        node = tree.nodes.active if tree else None
-        return bool(
-            node
-            and node.bl_idname == "GeometryNodeGroup"
-            and node.node_tree
-            and node.node_tree.name.startswith(GROUP_NAME)
-        )
+        return get_active_parametric_node(context) is not None
 
     def draw(self, context):
         layout = self.layout
-        node = context.space_data.edit_tree.nodes.active
+        tree = get_editor_tree(context)
+        node = get_active_parametric_node(context)
+        if tree is None or node is None:
+            return
+
+        settings = get_surface_settings(tree, node, create=True)
+        if settings is None:
+            layout.label(text="Settings unavailable", icon="ERROR")
+            return
+
         col = layout.column(align=True)
-        col.prop(node, '["x_expr"]', text="x(u,v)")
-        col.prop(node, '["y_expr"]', text="y(u,v)")
-        col.prop(node, '["z_expr"]', text="z(u,v)")
+        col.prop(settings, "x_expr", text="x(u,v)")
+        col.prop(settings, "y_expr", text="y(u,v)")
+        col.prop(settings, "z_expr", text="z(u,v)")
         layout.separator()
-        layout.operator("node.build_parametric_surface_gn", icon="FILE_REFRESH")
+
+        op = layout.operator("node.build_parametric_surface_gn", icon="FILE_REFRESH")
+        op.parent_tree_name = tree.name
+        op.node_name = node.name
 
 
 # ---------------------------------------
@@ -530,6 +680,7 @@ def menu_func(self, context):
 
 
 classes = (
+    ParametricSurfaceNodeSettings,
     NODE_OT_add_parametric_surface_gn,
     NODE_OT_build_parametric_surface,
     NODE_PT_parametric_surface,
@@ -539,11 +690,27 @@ classes = (
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+
+    # NodeTree is an ID data-block and officially supports registered custom
+    # properties. Store one settings record per Parametric Surface node.
+    setattr(
+        bpy.types.NodeTree,
+        SETTINGS_COLLECTION,
+        CollectionProperty(type=ParametricSurfaceNodeSettings),
+    )
+
     bpy.types.NODE_MT_add.append(menu_func)
 
 
 def unregister():
-    bpy.types.NODE_MT_add.remove(menu_func)
+    try:
+        bpy.types.NODE_MT_add.remove(menu_func)
+    except Exception:
+        pass
+
+    if hasattr(bpy.types.NodeTree, SETTINGS_COLLECTION):
+        delattr(bpy.types.NodeTree, SETTINGS_COLLECTION)
+
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
